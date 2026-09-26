@@ -1,4 +1,4 @@
-"""FastAPI 入口：重组 API、双次抓包差异定位 API、分片到达过程诊断 API、结果下载与静态页面托管。"""
+"""FastAPI 入口：重组 API、优先级恢复 API、双次抓包差异定位 API、分片到达过程诊断 API、结果下载与静态页面托管。"""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from .reassembly import (
     ReassemblyError,
     arrival_trace as run_arrival_trace,
     assemble,
+    assemble_with_priority,
     diff_captures,
 )
 
@@ -48,6 +49,21 @@ class ReassembleIn(BaseModel):
 
     expected_length: StrictInt = Field(..., ge=0, description="预期还原负载的总字节数")
     fragments: list[FragmentIn] = Field(..., min_length=1)
+
+
+class PriorityFragmentIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    offset: StrictInt = Field(..., description="分片起始字节偏移，0 起算")
+    data: str = Field(..., description="分片原始内容的十六进制表示")
+    priority: StrictInt = Field(0, description="整数优先级，越大越优先，默认 0")
+
+
+class PriorityReassembleIn(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    expected_length: StrictInt = Field(..., ge=0, description="预期还原负载的总字节数")
+    fragments: list[PriorityFragmentIn] = Field(..., min_length=1)
 
 
 class DiffIn(BaseModel):
@@ -83,8 +99,8 @@ def _store_job(payload: bytes) -> str:
 
 app = FastAPI(
     title="单向抓包负载重组工具",
-    description="按字节偏移重组乱序分片，标注重叠冲突与覆盖缺口；支持 A/B 双次抓包差异定位与分片到达过程诊断。",
-    version="1.2.0",
+    description="按字节偏移重组乱序分片，标注重叠冲突与覆盖缺口；支持按优先级裁决恢复、A/B 双次抓包差异定位与分片到达过程诊断。",
+    version="1.3.0",
 )
 
 
@@ -127,6 +143,36 @@ async def reassemble(body: ReassembleIn) -> dict[str, Any]:
         max_total_input=MAX_TOTAL_INPUT,
     )
 
+    if payload is not None:
+        report["job_id"] = _store_job(payload)
+        report["download_url"] = f"/api/download/{report['job_id']}"
+    else:
+        report["job_id"] = None
+        report["download_url"] = None
+    return report
+
+
+@app.post("/api/reassemble-priority")
+async def reassemble_priority(body: PriorityReassembleIn) -> dict[str, Any]:
+    if body.expected_length > MAX_EXPECTED_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"预期字节数 {body.expected_length} 超过上限 {MAX_EXPECTED_LENGTH}",
+        )
+    if len(body.fragments) > MAX_FRAGMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"分片数量 {len(body.fragments)} 超过上限 {MAX_FRAGMENTS}",
+        )
+
+    report, payload = assemble_with_priority(
+        body.expected_length,
+        [f.model_dump() for f in body.fragments],
+        max_fragments=MAX_FRAGMENTS,
+        max_total_input=MAX_TOTAL_INPUT,
+    )
+
+    # 仅当全部字节都有唯一裁决（无缺口、无未决冲突）时才进入下载缓存
     if payload is not None:
         report["job_id"] = _store_job(payload)
         report["download_url"] = f"/api/download/{report['job_id']}"

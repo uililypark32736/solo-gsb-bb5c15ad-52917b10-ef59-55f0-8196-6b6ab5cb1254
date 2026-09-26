@@ -9,7 +9,7 @@
 <body>
   <header class="topbar">
     <h1>单向抓包负载重组</h1>
-    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · A/B 双次抓包差异定位 · 分片到达过程诊断</p>
+    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · 按优先级裁决恢复 · A/B 双次抓包差异定位 · 分片到达过程诊断</p>
   </header>
 
   <main>
@@ -19,11 +19,12 @@
         <label for="expectedLength">预期字节数</label>
         <input id="expectedLength" type="text" value="16" spellcheck="false"
                placeholder="十进制或 0x 十六进制" />
-        <span class="hint">负载从偏移 0 到该长度，区间左闭右开。</span>
+        <span class="hint">负载从偏移 0 到该长度，区间左闭右开。优先级列为整数（可负），默认 0，仅「优先级恢复」使用。</span>
       </div>
 
-      <div class="frag-head">
+      <div class="frag-head with-prio">
         <span class="col-offset">起始偏移</span>
+        <span class="col-prio">优先级</span>
         <span class="col-data">十六进制内容（允许空格 / 冒号分隔）</span>
         <span class="col-op"></span>
       </div>
@@ -33,7 +34,9 @@
         <button id="addFrag" type="button" class="btn">＋ 添加分片</button>
         <button id="loadDemoGap" type="button" class="btn btn-ghost">填充示例：乱序+冲突+缺口</button>
         <button id="loadDemoOk" type="button" class="btn btn-ghost">填充示例：完整可下载</button>
+        <button id="loadDemoPrio" type="button" class="btn btn-ghost">填充示例：优先级裁决</button>
         <button id="submit" type="button" class="btn btn-primary">重组</button>
+        <button id="prioSubmit" type="button" class="btn btn-primary">优先级恢复</button>
         <button id="traceSubmit" type="button" class="btn">诊断到达过程</button>
       </div>
       <div id="error" class="error" hidden></div>
@@ -87,6 +90,57 @@
       <div class="download-row">
         <button id="downloadBtn" type="button" class="btn btn-download" hidden>⬇ 下载还原的二进制</button>
         <span id="downloadNote" class="hint"></span>
+      </div>
+    </section>
+
+    <section id="prioResultCard" class="card" hidden>
+      <h2>优先级恢复 · 结果</h2>
+
+      <div id="prioBanner" class="banner"></div>
+
+      <div class="stats" id="prioStats"></div>
+
+      <h3>覆盖示意图（偏移 0 → 预期长度；冲突为同级异值的未决冲突）</h3>
+      <div class="legend">
+        <span class="lg lg-covered">覆盖</span>
+        <span class="lg lg-conflict">未决冲突</span>
+        <span class="lg lg-gap">缺口</span>
+        <span id="prioBarHint" class="hint"></span>
+      </div>
+      <div id="prioCoverageBar" class="coverage-bar"></div>
+
+      <div class="columns">
+        <div class="column">
+          <h3>裁决来源区间（连续相同获胜来源）<span id="prioSourceCount" class="count"></span></h3>
+          <ul id="prioSourceList" class="range-list source-list"></ul>
+        </div>
+        <div class="column">
+          <h3>未决冲突区间（同级异值）<span id="prioConflictCount" class="count"></span></h3>
+          <ul id="prioConflictList" class="range-list conflict-list"></ul>
+          <div id="prioConflictSamples" class="samples"></div>
+        </div>
+        <div class="column">
+          <h3>缺口区间（[0, 预期长度) 内全部未覆盖位置）<span id="prioGapCount" class="count"></span></h3>
+          <ul id="prioGapList" class="range-list gap-list"></ul>
+        </div>
+      </div>
+
+      <h3>提交的分片（按提交顺序）</h3>
+      <div class="table-wrap">
+        <table id="prioFragTable">
+          <thead>
+            <tr><th>#</th><th>起始偏移</th><th>优先级</th><th>长度</th><th>覆盖范围</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h3>字节预览（取裁决后的值，每 16 字节一行；灰色为缺口位置，红色为未决冲突）</h3>
+      <pre id="prioPreview" class="preview"></pre>
+
+      <div class="download-row">
+        <button id="prioDownloadBtn" type="button" class="btn btn-download" hidden>⬇ 下载还原的二进制</button>
+        <span id="prioDownloadNote" class="hint"></span>
       </div>
     </section>
 
@@ -227,6 +281,7 @@
   </footer>
 
   <script src="/static/app.js"></script>
+  <script src="/static/priority.js"></script>
   <script src="/static/diff.js"></script>
 </body>
 </html>

@@ -15,6 +15,14 @@
 未覆盖 / 唯一值 / 冲突 三态，逐片统计本次新增覆盖与
 首次变为冲突的字节数及累计值，并抽样记录首次冲突位置
 （偏移、最先写入的分片、触发冲突的分片）。
+
+优先级恢复重组：每个分片可携带整数优先级（默认 0），
+逐字节只采用覆盖该位置的最高优先级取值：
+  * 最高优先级下取值一致     -> 采用该值，来源为同级中最早录入的分片；
+  * 最高优先级下取值互相矛盾 -> 未决冲突；
+  * 更低优先级的取值         -> 不参与裁决，异值也不污染结果；
+  * 更高优先级的写入         -> 压制此前较低优先级形成的裁决（含未决冲突）。
+除缺口与未决冲突区间外，另返回连续相同获胜来源的半开区间。
 """
 
 from __future__ import annotations
@@ -92,18 +100,19 @@ def _parse_fragments(
     max_fragments: int,
     max_total_input: int,
     side: str = "",
-) -> tuple[list[tuple[int, bytes]], int, bool]:
+) -> tuple[list[tuple[int, bytes, int]], int, bool]:
     """校验并解析一组分片。
 
     side 为错误消息前缀（如 "A 侧"），单次重组时留空。
-    返回 ([(offset, payload), ...], 输入字节总量, 是否按序到达)。
+    返回 ([(offset, payload, priority), ...], 输入字节总量, 是否按序到达)。
+    分片未提供 priority 时按 0 处理；priority 须为 64 位有符号整数。
     """
     if not isinstance(fragments, list) or not fragments:
         raise ReassemblyError(f"{side}至少需要提交一个分片")
     if len(fragments) > max_fragments:
         raise ReassemblyError(f"{side}分片数量 {len(fragments)} 超过上限 {max_fragments}")
 
-    parsed: list[tuple[int, bytes]] = []
+    parsed: list[tuple[int, bytes, int]] = []
     total_input = 0
     last_end = 0
     in_order = True
@@ -115,6 +124,13 @@ def _parse_fragments(
             raise ReassemblyError(f"{side}分片 {i + 1} 的起始偏移必须是非负整数")
         if offset < 0:
             raise ReassemblyError(f"{side}分片 {i + 1} 的起始偏移不能为负数")
+        prio = frag.get("priority", 0)
+        if isinstance(prio, bool) or not isinstance(prio, int):
+            raise ReassemblyError(f"{side}分片 {i + 1} 的优先级必须是整数")
+        if not -(1 << 63) <= prio < (1 << 63):
+            raise ReassemblyError(
+                f"{side}分片 {i + 1} 的优先级 {prio} 超出 64 位有符号整数范围"
+            )
         payload = parse_hex_payload(frag.get("data", ""), i, side)
         length = len(payload)
         if length == 0:
@@ -132,14 +148,14 @@ def _parse_fragments(
         if offset < last_end:
             in_order = False
         last_end = max(last_end, offset + length)
-        parsed.append((offset, payload))
+        parsed.append((offset, payload, prio))
     return parsed, total_input, in_order
 
 
 def _build_masks(
-    expected_length: int, parsed: list[tuple[int, bytes]]
+    expected_length: int, parsed: list[tuple[int, bytes, int]]
 ) -> tuple[bytearray, bytearray, bytearray, dict[int, list[int]], int, int]:
-    """把分片写入逐字节状态。
+    """把分片写入逐字节状态（忽略优先级，先到先得）。
 
     返回 (data, covered, conflict, value_sets, 同值去重字节数, 异值写入次数)：
       * data     —— 每个位置最先到达的取值；
@@ -155,7 +171,7 @@ def _build_masks(
     dup_bytes = 0  # 同值重叠字节数
     conflict_bytes = 0  # 异值重叠写入次数（按写入计）
 
-    for offset, payload in parsed:
+    for offset, payload, _prio in parsed:
         for j, value in enumerate(payload):
             pos = offset + j
             if not covered[pos]:
@@ -234,7 +250,7 @@ def assemble(
             "length": len(pay),
             "end": off + len(pay),
         }
-        for i, (off, pay) in enumerate(parsed)
+        for i, (off, pay, _prio) in enumerate(parsed)
     ]
 
     report: dict[str, Any] = {
@@ -255,6 +271,179 @@ def assemble(
         "coverage": coverage_runs,
         "conflicts": conflict_runs,
         "gaps": gap_runs,
+        "conflict_samples": conflict_samples,
+        "conflict_samples_truncated": len(value_sets) > len(conflict_samples),
+        "preview_hex": preview_hex,
+        "preview_truncated": preview_truncated,
+        "fragments": fragment_report,
+    }
+    return report, payload_out
+
+
+def assemble_with_priority(
+    expected_length: int,
+    fragments: list[dict[str, Any]],
+    *,
+    max_fragments: int,
+    max_total_input: int,
+) -> tuple[dict[str, Any], bytes | None]:
+    """优先级恢复重组。
+
+    逐字节只采用覆盖该位置的最高优先级取值：
+      * 最高优先级下取值一致 -> 采用该值，来源为同级中最早录入的分片；
+      * 最高优先级下取值互相矛盾 -> 未决冲突（仍标出，不猜测取值）；
+      * 更低优先级的写入（无论同值异值）不参与裁决，不污染结果；
+      * 更高优先级的写入压制此前较低优先级形成的裁决（含未决冲突）。
+
+    返回 (报告字典, 可下载字节)。报告含缺口、未决冲突区间以及
+    连续相同获胜来源的半开区间；只有范围完整（无缺口）且无未决
+    冲突时，第二项才是完整字节串，否则为 None。
+    """
+    _check_expected_length(expected_length)
+    parsed, total_input, in_order = _parse_fragments(
+        expected_length,
+        fragments,
+        max_fragments=max_fragments,
+        max_total_input=max_total_input,
+    )
+
+    data = bytearray(expected_length)  # 每个位置当前裁决的取值
+    covered = bytearray(expected_length)  # 0/1 掩码
+    conflict = bytearray(expected_length)  # 0/1 掩码：当前最高优先级下存在异值
+    best_prio = array("q", [0]) * expected_length  # 当前最高优先级（covered 时有效）
+    winner = array("i", [-1]) * expected_length  # 当前裁决来源分片序号（0 起算）
+    # 未决冲突位置 -> 当前最高优先级下收到过的不同取值（限幅，仅用于展示）
+    value_sets: dict[int, list[int]] = {}
+
+    dup_bytes = 0  # 同级同值去重字节数
+    conflict_writes = 0  # 同级异值写入次数（按写入计）
+    suppressed_writes = 0  # 低优先级写入被忽略次数（按写入计）
+    override_writes = 0  # 高优先级取代现有裁决次数（按写入计）
+
+    for k, (offset, payload, prio) in enumerate(parsed):
+        for j, value in enumerate(payload):
+            pos = offset + j
+            if not covered[pos]:
+                covered[pos] = 1
+                best_prio[pos] = prio
+                data[pos] = value
+                winner[pos] = k
+                continue
+            if prio < best_prio[pos]:
+                # 低级写入不参与裁决，异值也不污染结果
+                suppressed_writes += 1
+                continue
+            if prio > best_prio[pos]:
+                # 更高级写入压制现有裁决，此前的同级未决冲突一并解除
+                best_prio[pos] = prio
+                data[pos] = value
+                winner[pos] = k
+                conflict[pos] = 0
+                value_sets.pop(pos, None)
+                override_writes += 1
+                continue
+            # 同级写入
+            if conflict[pos]:
+                vs = value_sets.get(pos)
+                if vs is not None and value not in vs and len(vs) < SAMPLE_VALUES_PER_POSITION:
+                    vs.append(value)
+                conflict_writes += 1
+                continue
+            if data[pos] == value:
+                # 同级同值：去重，来源保持同级中最早录入的分片
+                dup_bytes += 1
+                continue
+            # 同级异值：未决冲突
+            conflict[pos] = 1
+            vs = [data[pos], value]
+            value_sets[pos] = vs[:SAMPLE_VALUES_PER_POSITION]
+            conflict_writes += 1
+
+    # 由 0/1 掩码生成行程区间（逐字节扫描，上限受 expected_length 配置约束）
+    coverage_runs = _mask_to_runs(covered)
+    conflict_runs = _mask_to_runs(conflict)
+    gap_runs = invert_runs(coverage_runs, expected_length)
+
+    covered_length = sum(e - s for s, e in coverage_runs)
+    conflict_length = sum(e - s for s, e in conflict_runs)
+    complete = covered_length == expected_length
+    has_conflict = conflict_length > 0
+    downloadable = complete and not has_conflict
+    payload_out: bytes | None = bytes(data) if downloadable else None
+
+    # 连续相同获胜来源的半开区间：只统计有唯一裁决的字节，
+    # 缺口与未决冲突位置没有获胜来源，会打断区间
+    source_runs: list[dict[str, Any]] = []
+    run_start = 0
+    run_winner = -1
+    for pos in range(expected_length):
+        w = winner[pos] if covered[pos] and not conflict[pos] else -1
+        if w != run_winner:
+            if run_winner >= 0:
+                source_runs.append(
+                    {
+                        "start": run_start,
+                        "end": pos,
+                        "fragment": run_winner + 1,
+                        "priority": parsed[run_winner][2],
+                    }
+                )
+            run_start = pos
+            run_winner = w
+    if run_winner >= 0:
+        source_runs.append(
+            {
+                "start": run_start,
+                "end": expected_length,
+                "fragment": run_winner + 1,
+                "priority": parsed[run_winner][2],
+            }
+        )
+
+    conflict_samples = [
+        {"offset": pos, "priority": best_prio[pos], "values": vs}
+        for pos, vs in sorted(value_sets.items())[:SAMPLE_POSITION_LIMIT]
+    ]
+
+    preview_hex = None
+    preview_truncated = False
+    if expected_length:
+        preview_len = min(expected_length, PREVIEW_LIMIT)
+        preview_hex = bytes(data[:preview_len]).hex()
+        preview_truncated = expected_length > preview_len
+
+    fragment_report = [
+        {
+            "index": i + 1,
+            "offset": off,
+            "length": len(pay),
+            "end": off + len(pay),
+            "priority": prio,
+        }
+        for i, (off, pay, prio) in enumerate(parsed)
+    ]
+
+    report: dict[str, Any] = {
+        "expected_length": expected_length,
+        "complete": complete,
+        "has_conflict": has_conflict,
+        "downloadable": downloadable,
+        "in_order": in_order,
+        "stats": {
+            "fragment_count": len(parsed),
+            "total_input_bytes": total_input,
+            "covered_length": covered_length,
+            "gap_length": expected_length - covered_length,
+            "conflict_length": conflict_length,
+            "duplicate_bytes": dup_bytes,
+            "conflict_write_count": conflict_writes,
+            "suppressed_write_count": suppressed_writes,
+            "override_write_count": override_writes,
+        },
+        "coverage": coverage_runs,
+        "conflicts": conflict_runs,
+        "gaps": gap_runs,
+        "source_runs": source_runs,
         "conflict_samples": conflict_samples,
         "conflict_samples_truncated": len(value_sets) > len(conflict_samples),
         "preview_hex": preview_hex,
@@ -297,7 +486,7 @@ def arrival_trace(
     samples: list[dict[str, Any]] = []
     cum_covered = 0
     cum_conflict = 0
-    for k, (offset, payload) in enumerate(parsed):
+    for k, (offset, payload, _prio) in enumerate(parsed):
         new_covered = 0
         new_conflicts = 0
         for j, value in enumerate(payload):
@@ -459,7 +648,7 @@ def diff_captures(
     ]
 
     def side_stats(
-        parsed: list[tuple[int, bytes]],
+        parsed: list[tuple[int, bytes, int]],
         total_input: int,
         in_order: bool,
         covered: bytearray,

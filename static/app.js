@@ -11,6 +11,7 @@ const els = {
   resultCard: document.getElementById("resultCard"),
   loadDemoGap: document.getElementById("loadDemoGap"),
   loadDemoOk: document.getElementById("loadDemoOk"),
+  loadDemoPrio: document.getElementById("loadDemoPrio"),
 };
 
 function parseOffset(text, what) {
@@ -30,18 +31,37 @@ function parseOffset(text, what) {
   return n;
 }
 
+// 优先级：整数（可负），空串按 0 处理
+function parsePriority(text, what) {
+  const t = text.trim();
+  if (t === "") return 0;
+  let n;
+  if (/^0x[0-9a-fA-F]+$/.test(t)) {
+    n = parseInt(t, 16);
+  } else if (/^-?\d+$/.test(t)) {
+    n = parseInt(t, 10);
+  } else {
+    throw new Error(`${what} 只能是整数（十进制或 0x 十六进制）：${t}`);
+  }
+  if (!Number.isSafeInteger(n)) {
+    throw new Error(`${what} 非法：${t}`);
+  }
+  return n;
+}
+
 function hexByteLen(hex) {
   return hex.replace(/[\s:_-]/g, "").length / 2;
 }
 
 let fragSeq = 0;
 
-function addFragment(offset = "", data = "") {
+function addFragment(offset = "", data = "", priority = "") {
   fragSeq += 1;
   const row = document.createElement("div");
-  row.className = "frag-row";
+  row.className = "frag-row with-prio";
   row.innerHTML = `
     <input class="frag-offset" placeholder="如 12 或 0x0c" spellcheck="false" />
+    <input class="frag-prio" placeholder="0" title="整数优先级（可负），默认 0；仅「优先级恢复」使用" spellcheck="false" />
     <input class="frag-data" placeholder="如 48656c6c6f 或 48:65:6c" spellcheck="false" />
     <span class="col-op">
       <span class="idx"></span>
@@ -49,6 +69,7 @@ function addFragment(offset = "", data = "") {
     </span>`;
   row.querySelector(".frag-offset").value = offset;
   row.querySelector(".frag-data").value = data;
+  row.querySelector(".frag-prio").value = priority;
   row.querySelector(".del").addEventListener("click", () => {
     row.remove();
     refreshIndexes();
@@ -67,9 +88,10 @@ function refreshIndexes() {
 function loadDemo(expected, frags) {
   els.expectedLength.value = String(expected);
   els.fragments.innerHTML = "";
-  frags.forEach(([off, data]) => addFragment(off, data));
+  frags.forEach(([off, data, prio]) => addFragment(off, data, prio === undefined ? "" : prio));
   els.resultCard.hidden = true;
   els.error.hidden = true;
+  document.getElementById("prioResultCard").hidden = true;
   document.getElementById("traceResultCard").hidden = true;
 }
 
@@ -90,19 +112,32 @@ els.loadDemoOk.addEventListener("click", () => {
     ["10", "643020746f21"],
   ]);
 });
+els.loadDemoPrio.addEventListener("click", () => {
+  // 优先级裁决：片2 与片1 在偏移 10 同级异值（未决冲突），片3 以更高优先级压制；
+  // 片4 优先级为负，异值不污染结果；片5 与片1 同级同值，去重且来源仍是片1
+  loadDemo(16, [
+    ["0", "48656c6c6f20576f726c64", "0"],    // "Hello World" @ [0,11)
+    ["10", "585858585821", "0"],             // "XXXXX!" @ [10,16)，与片1 在偏移 10 同级异值
+    ["10", "643020746f21", "3"],             // "d0 to!" @ [10,16)，优先级 3 压制片2
+    ["0", "0000000000000000", "-1"],         // 低优先级异值，被忽略不污染
+    ["0", "48656c6c6f20576f", "0"],          // 与片1 同级同值，去重
+  ]);
+});
 
 function showError(msg) {
   els.error.textContent = msg;
   els.error.hidden = false;
 }
 
-// 收集单次重组表单中的分片（到达过程诊断复用同一表单与录入顺序）
-function collectSingleFragments(expected) {
+// 收集单次重组表单中的分片（到达过程诊断复用同一表单与录入顺序）；
+// withPriority 为 true 时附加整数优先级（空按 0），供「优先级恢复」使用
+function collectSingleFragments(expected, withPriority = false) {
   const rows = [...els.fragments.querySelectorAll(".frag-row")];
   const fragments = [];
   rows.forEach((row, i) => {
     const offText = row.querySelector(".frag-offset").value;
     const dataText = row.querySelector(".frag-data").value;
+    const prioText = row.querySelector(".frag-prio").value;
     if (offText.trim() === "" && dataText.trim() === "") return; // 跳过完全空行
     const off = parseOffset(offText, `分片 #${i + 1} 的起始偏移`);
     const stripped = dataText.replace(/[\s:_-]/g, "");
@@ -118,7 +153,11 @@ function collectSingleFragments(expected) {
         `分片 #${i + 1}（偏移 ${off}，长度 ${stripped.length / 2}）超出预期长度 ${expected}`
       );
     }
-    fragments.push({ offset: off, data: stripped });
+    const frag = { offset: off, data: stripped };
+    if (withPriority) {
+      frag.priority = parsePriority(prioText, `分片 #${i + 1} 的优先级`);
+    }
+    fragments.push(frag);
   });
   if (fragments.length === 0) {
     throw new Error("请至少填写一个分片（起始偏移 + 十六进制内容）");
@@ -200,10 +239,10 @@ function addStat(k, v, cls) {
   return d;
 }
 
-function renderBar(total, coverage, conflicts) {
-  const bar = document.getElementById("coverageBar");
+function renderBar(total, coverage, conflicts, barId = "coverageBar", hintId = "barHint") {
+  const bar = document.getElementById(barId);
   bar.innerHTML = "";
-  const hint = document.getElementById("barHint");
+  const hint = document.getElementById(hintId);
   if (total === 0) {
     const seg = document.createElement("div");
     seg.className = "seg gap";
@@ -251,8 +290,8 @@ function renderBar(total, coverage, conflicts) {
     buckets < total ? `共 ${buckets} 个示意桶（每桶 ≈ ${scale.toFixed(2)} 字节，悬停看范围）` : "每格 1 字节，悬停看范围";
 }
 
-function renderPreview(expected, previewHex, truncated, conflictRuns) {
-  const pre = document.getElementById("preview");
+function renderPreview(expected, previewHex, truncated, conflictRuns, preId = "preview") {
+  const pre = document.getElementById(preId);
   pre.innerHTML = "";
   if (expected === 0) {
     pre.textContent = "（预期长度为 0，无字节可预览）";
@@ -407,6 +446,7 @@ addFragment();
 function invalidateResult() {
   els.resultCard.hidden = true;
   els.error.hidden = true;
+  document.getElementById("prioResultCard").hidden = true;
 }
 els.expectedLength.addEventListener("input", invalidateResult);
 els.fragments.addEventListener("input", invalidateResult);
