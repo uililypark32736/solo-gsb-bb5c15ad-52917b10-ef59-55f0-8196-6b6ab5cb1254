@@ -17,9 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from .reassembly import (
     FIRST_CONFLICT_SAMPLE_LIMIT,
     MAX_DIFF_WINDOW as DEFAULT_MAX_DIFF_WINDOW,
+    PRIORITY_VALUE_LIMIT,
     ReassemblyError,
     arrival_trace as run_arrival_trace,
     assemble,
+    assemble_priority,
     diff_captures,
 )
 
@@ -41,6 +43,10 @@ class FragmentIn(BaseModel):
 
     offset: StrictInt = Field(..., description="分片起始字节偏移，0 起算")
     data: str = Field(..., description="分片原始内容的十六进制表示")
+    priority: StrictInt = Field(
+        default=0,
+        description="优先级恢复模式下的整数优先级，越大越优先；其他接口忽略该字段",
+    )
 
 
 class ReassembleIn(BaseModel):
@@ -48,6 +54,13 @@ class ReassembleIn(BaseModel):
 
     expected_length: StrictInt = Field(..., ge=0, description="预期还原负载的总字节数")
     fragments: list[FragmentIn] = Field(..., min_length=1)
+
+
+class ReassemblePriorityIn(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    expected_length: StrictInt = Field(..., ge=0, description="预期还原负载的总字节数")
+    fragments: list[FragmentIn] = Field(..., min_length=1, description="带整数优先级的分片")
 
 
 class DiffIn(BaseModel):
@@ -83,8 +96,8 @@ def _store_job(payload: bytes) -> str:
 
 app = FastAPI(
     title="单向抓包负载重组工具",
-    description="按字节偏移重组乱序分片，标注重叠冲突与覆盖缺口；支持 A/B 双次抓包差异定位与分片到达过程诊断。",
-    version="1.2.0",
+    description="按字节偏移重组乱序分片，标注重叠冲突与覆盖缺口；支持优先级恢复、A/B 双次抓包差异定位与分片到达过程诊断。",
+    version="1.3.0",
 )
 
 
@@ -103,6 +116,7 @@ async def health() -> dict[str, Any]:
             "max_total_input": MAX_TOTAL_INPUT,
             "max_diff_window": MAX_DIFF_WINDOW,
             "max_first_conflict_samples": FIRST_CONFLICT_SAMPLE_LIMIT,
+            "priority_value_limit": PRIORITY_VALUE_LIMIT,
         },
     }
 
@@ -121,6 +135,40 @@ async def reassemble(body: ReassembleIn) -> dict[str, Any]:
         )
 
     report, payload = assemble(
+        body.expected_length,
+        [f.model_dump() for f in body.fragments],
+        max_fragments=MAX_FRAGMENTS,
+        max_total_input=MAX_TOTAL_INPUT,
+    )
+
+    if payload is not None:
+        report["job_id"] = _store_job(payload)
+        report["download_url"] = f"/api/download/{report['job_id']}"
+    else:
+        report["job_id"] = None
+        report["download_url"] = None
+    return report
+
+
+@app.post("/api/reassemble-priority")
+async def reassemble_priority(body: ReassemblePriorityIn) -> dict[str, Any]:
+    """优先级恢复：每片带整数优先级，逐字节只采用最高优先级层的裁决。
+
+    复用与 /api/reassemble 相同的 hex 解析、分片数、字节总量与预期长度上限；
+    仅当全部字节都有唯一裁决（无缺口、无未决冲突）时写入下载缓存并开放下载。
+    """
+    if body.expected_length > MAX_EXPECTED_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"预期字节数 {body.expected_length} 超过上限 {MAX_EXPECTED_LENGTH}",
+        )
+    if len(body.fragments) > MAX_FRAGMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"分片数量 {len(body.fragments)} 超过上限 {MAX_FRAGMENTS}",
+        )
+
+    report, payload = assemble_priority(
         body.expected_length,
         [f.model_dump() for f in body.fragments],
         max_fragments=MAX_FRAGMENTS,

@@ -15,6 +15,15 @@
 未覆盖 / 唯一值 / 冲突 三态，逐片统计本次新增覆盖与
 首次变为冲突的字节数及累计值，并抽样记录首次冲突位置
 （偏移、最先写入的分片、触发冲突的分片）。
+
+优先级恢复：每个分片额外带整数优先级（默认 0，越大越优先），
+逐字节只在覆盖该位置的最高优先级片之间裁决：
+  * 最高层取值一致 -> 唯一裁决，来源取最早录入片；
+  * 最高层取值不同 -> 未决冲突；
+  * 更低优先级片的异值 / 同值写入一律被抑制，不污染结果；
+  * 更高优先级片到达时，旧顶层写入整体降级，旧冲突可被恢复。
+返回缺口、未决冲突区间与连续相同获胜来源的半开区间；
+仅全部字节有唯一裁决时产出可下载二进制。
 """
 
 from __future__ import annotations
@@ -32,6 +41,8 @@ PREVIEW_LIMIT = 512
 MAX_DIFF_WINDOW = 65536
 # 到达过程诊断中，首次冲突样本的最大条数
 FIRST_CONFLICT_SAMPLE_LIMIT = 2000
+# 优先级恢复中，单片优先级数值的允许范围（与 JS 安全整数对齐）
+PRIORITY_VALUE_LIMIT = 2**53 - 1
 
 # 差异定位的逐字节类别
 CATEGORY_SAME = "same"  # 两侧均为唯一值且相等
@@ -92,18 +103,24 @@ def _parse_fragments(
     max_fragments: int,
     max_total_input: int,
     side: str = "",
-) -> tuple[list[tuple[int, bytes]], int, bool]:
+    with_priority: bool = False,
+) -> tuple[list[tuple[int, bytes]], int, bool] | tuple[
+    list[tuple[int, bytes, int]], int, bool
+]:
     """校验并解析一组分片。
 
     side 为错误消息前缀（如 "A 侧"），单次重组时留空。
-    返回 ([(offset, payload), ...], 输入字节总量, 是否按序到达)。
+    with_priority=True 时读取每片的 priority（整数，缺省 0），
+    返回三元组 [(offset, payload, priority), ...]；
+    否则返回二元组 [(offset, payload), ...]。
+    第二项为输入字节总量，第三项为是否按序到达。
     """
     if not isinstance(fragments, list) or not fragments:
         raise ReassemblyError(f"{side}至少需要提交一个分片")
     if len(fragments) > max_fragments:
         raise ReassemblyError(f"{side}分片数量 {len(fragments)} 超过上限 {max_fragments}")
 
-    parsed: list[tuple[int, bytes]] = []
+    parsed: list[tuple[int, bytes]] | list[tuple[int, bytes, int]] = []
     total_input = 0
     last_end = 0
     in_order = True
@@ -132,7 +149,18 @@ def _parse_fragments(
         if offset < last_end:
             in_order = False
         last_end = max(last_end, offset + length)
-        parsed.append((offset, payload))
+        if with_priority:
+            priority = frag.get("priority", 0)
+            if isinstance(priority, bool) or not isinstance(priority, int):
+                raise ReassemblyError(f"{side}分片 {i + 1} 的优先级必须是整数")
+            if abs(priority) > PRIORITY_VALUE_LIMIT:
+                raise ReassemblyError(
+                    f"{side}分片 {i + 1} 的优先级 {priority} 超出范围 "
+                    f"[-{PRIORITY_VALUE_LIMIT}, {PRIORITY_VALUE_LIMIT}]"
+                )
+            parsed.append((offset, payload, priority))
+        else:
+            parsed.append((offset, payload))
     return parsed, total_input, in_order
 
 
@@ -354,6 +382,203 @@ def arrival_trace(
         "first_conflict_samples_truncated": cum_conflict > len(samples),
         "sample_limit": FIRST_CONFLICT_SAMPLE_LIMIT,
     }
+
+
+def assemble_priority(
+    expected_length: int,
+    fragments: list[dict[str, Any]],
+    *,
+    max_fragments: int,
+    max_total_input: int,
+) -> tuple[dict[str, Any], bytes | None]:
+    """优先级恢复重组。
+
+    每个分片带整数优先级（缺省 0，越大越优先）。逐字节只在覆盖该位置的
+    最高优先级片之间裁决：
+      * 最高层取值一致 -> 唯一裁决，来源取最早录入片（同级同值去重）；
+      * 最高层出现异值 -> 未决冲突（不裁决、不产生获胜来源）；
+      * 更低优先级片的写入一律被抑制，既不覆盖获胜值也不制造冲突；
+      * 更高优先级片到达时旧顶层写入整体降级，旧冲突可由此被恢复。
+    只有全部字节都有唯一裁决（无缺口、无未决冲突）时才产出可下载字节。
+    """
+    _check_expected_length(expected_length)
+    parsed, total_input, in_order = _parse_fragments(
+        expected_length,
+        fragments,
+        max_fragments=max_fragments,
+        max_total_input=max_total_input,
+        with_priority=True,
+    )
+
+    n = expected_length
+    covered = bytearray(n)  # 0/1：该位置是否被任一分片覆盖
+    # 最高优先级层的获胜值（仅在有唯一裁决时有意义）
+    win_value = bytearray(n)
+    # 获胜来源片的录入序号（1 起算，0 表示无唯一裁决：缺口 / 未决冲突）
+    win_source = array("i", [0]) * n
+    # 覆盖该位置的最高优先级（q 为 8 字节有符号整数）
+    top_priority = array("q", [0]) * n
+    # 未决冲突位置 -> 最高层收到过的不同值及各自最早来源片（限幅，仅用于展示）
+    candidates: dict[int, list[dict[str, int]]] = {}
+    # 未决冲突位置 -> 最高层不同取值的实际个数（可能超过候选样本限幅）
+    distinct_counts: dict[int, int] = {}
+
+    dup_bytes = 0  # 最高层同值重写字节数（含冲突位上的同值重写）
+    conflict_writes = 0  # 最高层异值写入次数（按写入计）
+    suppressed_writes = 0  # 因优先级更低被抑制的字节写入次数
+    recovered_bytes = 0  # 曾为未决冲突、后被更高优先级恢复的字节数
+
+    for k, (offset, payload, priority) in enumerate(parsed):
+        frag_no = k + 1
+        for j, value in enumerate(payload):
+            pos = offset + j
+            if not covered[pos]:
+                covered[pos] = 1
+                win_value[pos] = value
+                win_source[pos] = frag_no
+                top_priority[pos] = priority
+                continue
+
+            if priority < top_priority[pos]:
+                # 低级片不污染结果：异值 / 同值写入都被抑制
+                suppressed_writes += 1
+                continue
+
+            if priority > top_priority[pos]:
+                # 新顶层覆盖旧顶层：旧冲突（若有）被恢复，旧值不参与新裁决
+                if win_source[pos] == 0:
+                    recovered_bytes += 1
+                candidates.pop(pos, None)
+                distinct_counts.pop(pos, None)
+                win_value[pos] = value
+                win_source[pos] = frag_no
+                top_priority[pos] = priority
+                continue
+
+            # 同级写入
+            if win_source[pos] != 0 and win_value[pos] == value:
+                # 同级同值：保留最早录入片作来源，计为同值去重
+                dup_bytes += 1
+                continue
+
+            conflict_writes += 1
+            if win_source[pos] != 0:
+                # 由唯一裁决首次变为未决冲突：旧获胜值与本片同时成为候选
+                candidates[pos] = [
+                    {"value": win_value[pos], "fragment": win_source[pos]},
+                    {"value": value, "fragment": frag_no},
+                ][:SAMPLE_VALUES_PER_POSITION]
+                distinct_counts[pos] = 2
+                win_source[pos] = 0
+            else:
+                entry = candidates.get(pos)
+                if entry is not None and not any(c["value"] == value for c in entry):
+                    distinct_counts[pos] += 1
+                    if len(entry) < SAMPLE_VALUES_PER_POSITION:
+                        entry.append({"value": value, "fragment": frag_no})
+                # 同级同值重发（指向更晚的同值来源片）：不重复计候选
+
+    coverage_runs = _mask_to_runs(covered)
+    # 未决冲突位置：已覆盖但无唯一裁决（win_source == 0）
+    undecided = bytearray(n)
+    for pos in range(n):
+        if win_source[pos] == 0:
+            undecided[pos] = covered[pos]
+    conflict_runs = _mask_to_runs(undecided)
+    gap_runs = invert_runs(coverage_runs, n)
+
+    covered_length = sum(e - s for s, e in coverage_runs)
+    conflict_length = sum(e - s for s, e in conflict_runs)
+    complete = covered_length == n
+    has_conflict = conflict_length > 0
+    downloadable = complete and not has_conflict
+    payload_out: bytes | None = bytes(win_value) if downloadable else None
+
+    # 连续相同获胜来源片的半开区间（缺口与未决冲突位置会打断区间）
+    source_runs: list[dict[str, int]] = []
+    run_start = -1
+    run_source = 0
+    run_priority = 0
+    for pos in range(n + 1):
+        source = win_source[pos] if pos < n else 0
+        if source != 0:
+            if run_start == -1:
+                run_start = pos
+                run_source = source
+                run_priority = top_priority[pos]
+            elif source != run_source:
+                source_runs.append(
+                    {"start": run_start, "end": pos, "fragment": run_source,
+                     "priority": run_priority}
+                )
+                run_start = pos
+                run_source = source
+                run_priority = top_priority[pos]
+        elif run_start != -1:
+            source_runs.append(
+                {"start": run_start, "end": pos, "fragment": run_source,
+                 "priority": run_priority}
+            )
+            run_start = -1
+
+    conflict_samples = [
+        {
+            "offset": pos,
+            "priority": top_priority[pos],
+            "candidates": candidates[pos],
+            "candidates_truncated": distinct_counts[pos] > len(candidates[pos]),
+        }
+        for pos in sorted(candidates)[:SAMPLE_POSITION_LIMIT]
+    ]
+
+    preview_hex = None
+    preview_truncated = False
+    if n:
+        preview_len = min(n, PREVIEW_LIMIT)
+        preview_hex = bytes(win_value[:preview_len]).hex()
+        preview_truncated = n > preview_len
+
+    fragment_report = [
+        {
+            "index": i + 1,
+            "offset": off,
+            "length": len(pay),
+            "end": off + len(pay),
+            "priority": priority,
+        }
+        for i, (off, pay, priority) in enumerate(parsed)
+    ]
+
+    report: dict[str, Any] = {
+        "mode": "priority",
+        "expected_length": n,
+        "complete": complete,
+        "has_conflict": has_conflict,
+        "downloadable": downloadable,
+        "in_order": in_order,
+        "stats": {
+            "fragment_count": len(parsed),
+            "total_input_bytes": total_input,
+            "covered_length": covered_length,
+            "gap_length": n - covered_length,
+            "decided_length": covered_length - conflict_length,
+            "conflict_length": conflict_length,
+            "duplicate_bytes": dup_bytes,
+            "conflict_write_count": conflict_writes,
+            "suppressed_write_count": suppressed_writes,
+            "recovered_conflict_bytes": recovered_bytes,
+        },
+        "coverage": coverage_runs,
+        "conflicts": conflict_runs,
+        "gaps": gap_runs,
+        "source_runs": source_runs,
+        "conflict_samples": conflict_samples,
+        "conflict_samples_truncated": len(candidates) > len(conflict_samples),
+        "preview_hex": preview_hex,
+        "preview_truncated": preview_truncated,
+        "fragments": fragment_report,
+    }
+    return report, payload_out
 
 
 def _side_reason(covered: bytearray, conflict: bytearray, pos: int) -> str | None:

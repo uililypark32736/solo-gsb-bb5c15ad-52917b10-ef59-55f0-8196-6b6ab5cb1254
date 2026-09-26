@@ -61,6 +61,13 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 40px; }
   gap: 10px;
   align-items: center;
 }
+/* 单次录入区多出一列整数优先级 */
+.single-frag-head, .single-frag-row {
+  grid-template-columns: 150px 110px 1fr 58px;
+}
+.frag-priority { text-align: center; }
+.prio-hint { margin-top: 10px; }
+.prio-cell { font-family: var(--mono); font-weight: 700; color: var(--accent); }
 .frag-head {
   color: var(--muted);
   font-size: 12px;
@@ -177,6 +184,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 40px; }
 .range-list li.empty { color: var(--muted); font-family: inherit; }
 .conflict-list li { color: #ffb3b3; }
 .gap-list li { color: var(--muted); }
+.source-list li { color: #8fd3a8; }
 .undecidable-list li { color: var(--warn); }
 
 .samples { margin-top: 8px; max-height: 220px; overflow: auto; }

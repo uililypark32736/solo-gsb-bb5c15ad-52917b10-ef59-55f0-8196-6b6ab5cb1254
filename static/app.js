@@ -7,11 +7,29 @@ const els = {
   fragments: document.getElementById("fragments"),
   addFrag: document.getElementById("addFrag"),
   submit: document.getElementById("submit"),
+  prioSubmit: document.getElementById("prioSubmit"),
+  loadDemoPrio: document.getElementById("loadDemoPrio"),
   error: document.getElementById("error"),
   resultCard: document.getElementById("resultCard"),
   loadDemoGap: document.getElementById("loadDemoGap"),
   loadDemoOk: document.getElementById("loadDemoOk"),
 };
+
+// 优先级可接受任意整数（含负数），范围与服务端 PRIORITY_VALUE_LIMIT 对齐
+const PRIORITY_VALUE_LIMIT = Number.MAX_SAFE_INTEGER;
+
+function parsePriority(text, what) {
+  const t = text.trim();
+  if (t === "") return 0; // 缺省为 0
+  if (!/^[+-]?\d+$/.test(t)) {
+    throw new Error(`${what} 只能是整数（默认 0）：${t}`);
+  }
+  const n = parseInt(t, 10);
+  if (!Number.isSafeInteger(n) || Math.abs(n) > PRIORITY_VALUE_LIMIT) {
+    throw new Error(`${what} 超出允许范围：${t}`);
+  }
+  return n;
+}
 
 function parseOffset(text, what) {
   const t = text.trim();
@@ -36,12 +54,13 @@ function hexByteLen(hex) {
 
 let fragSeq = 0;
 
-function addFragment(offset = "", data = "") {
+function addFragment(offset = "", data = "", priority = "") {
   fragSeq += 1;
   const row = document.createElement("div");
-  row.className = "frag-row";
+  row.className = "frag-row single-frag-row";
   row.innerHTML = `
     <input class="frag-offset" placeholder="如 12 或 0x0c" spellcheck="false" />
+    <input class="frag-priority" placeholder="0" inputmode="numeric" spellcheck="false" title="整数优先级，默认 0，越大越优先" />
     <input class="frag-data" placeholder="如 48656c6c6f 或 48:65:6c" spellcheck="false" />
     <span class="col-op">
       <span class="idx"></span>
@@ -49,6 +68,7 @@ function addFragment(offset = "", data = "") {
     </span>`;
   row.querySelector(".frag-offset").value = offset;
   row.querySelector(".frag-data").value = data;
+  row.querySelector(".frag-priority").value = priority;
   row.querySelector(".del").addEventListener("click", () => {
     row.remove();
     refreshIndexes();
@@ -67,8 +87,9 @@ function refreshIndexes() {
 function loadDemo(expected, frags) {
   els.expectedLength.value = String(expected);
   els.fragments.innerHTML = "";
-  frags.forEach(([off, data]) => addFragment(off, data));
+  frags.forEach(([off, data, priority]) => addFragment(off, data, priority));
   els.resultCard.hidden = true;
+  document.getElementById("prioResultCard").hidden = true;
   els.error.hidden = true;
   document.getElementById("traceResultCard").hidden = true;
 }
@@ -90,6 +111,20 @@ els.loadDemoOk.addEventListener("click", () => {
     ["10", "643020746f21"],
   ]);
 });
+els.loadDemoPrio.addEventListener("click", () => {
+  // 优先级恢复：优先级 0 的两片在 [6,8) 异值冲突；优先级 2 的片恢复 [0,14)，
+  // 低级噪声片给出的错误值全部被抑制；最终仅剩偏移 15 同级异值冲突。
+  loadDemo(16, [
+    ["0",  "5858585858585858", "-1"], // 8 个 'X' @ [0,8)，低级噪声
+    ["0",  "48656c6c6f20576f", "0"],  // "Hello Wo" @ [0,8)
+    ["6",  "5858313020746f21", "0"],  // "XX10 to!" @ [6,14)，[6,8) 与上片异值
+    ["0",  "48656c6c6f20576f726c643020746f", "2"], // "Hello World0 to" @ [0,14)，高级恢复
+    ["10", "643020746f", "0"],        // "d0 to" @ [10,15)，低级异值被高级片抑制
+    ["14", "21", "0"],                // '!' @ [14,15)，唯一覆盖 -> 裁决
+    ["15", "3f", "0"],                // '?' @ 偏移 15，与下片同级异值 -> 未决冲突
+    ["15", "21", "0"],                // '!' @ 偏移 15
+  ]);
+});
 
 function showError(msg) {
   els.error.textContent = msg;
@@ -97,13 +132,16 @@ function showError(msg) {
 }
 
 // 收集单次重组表单中的分片（到达过程诊断复用同一表单与录入顺序）
-function collectSingleFragments(expected) {
+// withPriority=true 时附带整数优先级，供 /api/reassemble-priority 使用
+function collectSingleFragments(expected, withPriority = false) {
   const rows = [...els.fragments.querySelectorAll(".frag-row")];
   const fragments = [];
   rows.forEach((row, i) => {
     const offText = row.querySelector(".frag-offset").value;
     const dataText = row.querySelector(".frag-data").value;
-    if (offText.trim() === "" && dataText.trim() === "") return; // 跳过完全空行
+    const prioEl = row.querySelector(".frag-priority");
+    const prioText = prioEl ? prioEl.value : "";
+    if (offText.trim() === "" && dataText.trim() === "" && prioText.trim() === "") return; // 跳过完全空行
     const off = parseOffset(offText, `分片 #${i + 1} 的起始偏移`);
     const stripped = dataText.replace(/[\s:_-]/g, "");
     if (stripped === "") throw new Error(`分片 #${i + 1} 的十六进制内容为空`);
@@ -118,7 +156,11 @@ function collectSingleFragments(expected) {
         `分片 #${i + 1}（偏移 ${off}，长度 ${stripped.length / 2}）超出预期长度 ${expected}`
       );
     }
-    fragments.push({ offset: off, data: stripped });
+    const frag = { offset: off, data: stripped };
+    if (withPriority) {
+      frag.priority = parsePriority(prioText, `分片 #${i + 1} 的优先级`);
+    }
+    fragments.push(frag);
   });
   if (fragments.length === 0) {
     throw new Error("请至少填写一个分片（起始偏移 + 十六进制内容）");
@@ -153,6 +195,36 @@ els.submit.addEventListener("click", () => {
     .finally(() => {
       els.submit.disabled = false;
       els.submit.textContent = "重组";
+    });
+});
+
+els.prioSubmit.addEventListener("click", () => {
+  els.error.hidden = true;
+  let expected, fragments;
+  try {
+    expected = parseOffset(els.expectedLength.value, "预期字节数");
+    fragments = collectSingleFragments(expected, true);
+  } catch (e) {
+    showError(e.message);
+    return;
+  }
+
+  els.prioSubmit.disabled = true;
+  els.prioSubmit.textContent = "裁决中…";
+  fetch("/api/reassemble-priority", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_length: expected, fragments }),
+  })
+    .then(async (resp) => {
+      const body = await resp.json();
+      if (!resp.ok) throw new Error(body.detail || `HTTP ${resp.status}`);
+      renderPriority(expected, body, fragments);
+    })
+    .catch((e) => showError(e.message))
+    .finally(() => {
+      els.prioSubmit.disabled = false;
+      els.prioSubmit.textContent = "优先级恢复";
     });
 });
 
@@ -200,10 +272,10 @@ function addStat(k, v, cls) {
   return d;
 }
 
-function renderBar(total, coverage, conflicts) {
-  const bar = document.getElementById("coverageBar");
+function renderBar(total, coverage, conflicts, barId = "coverageBar", hintId = "barHint") {
+  const bar = document.getElementById(barId);
   bar.innerHTML = "";
-  const hint = document.getElementById("barHint");
+  const hint = document.getElementById(hintId);
   if (total === 0) {
     const seg = document.createElement("div");
     seg.className = "seg gap";
@@ -251,8 +323,8 @@ function renderBar(total, coverage, conflicts) {
     buckets < total ? `共 ${buckets} 个示意桶（每桶 ≈ ${scale.toFixed(2)} 字节，悬停看范围）` : "每格 1 字节，悬停看范围";
 }
 
-function renderPreview(expected, previewHex, truncated, conflictRuns) {
-  const pre = document.getElementById("preview");
+function renderPreview(expected, previewHex, truncated, conflictRuns, preId = "preview") {
+  const pre = document.getElementById(preId);
   pre.innerHTML = "";
   if (expected === 0) {
     pre.textContent = "（预期长度为 0，无字节可预览）";
@@ -400,12 +472,131 @@ function render(expected, r, submitted) {
   }
 }
 
+// ------------------------------ 优先级恢复渲染 ------------------------------
+
+function renderPriority(expected, r, submitted) {
+  const card = document.getElementById("prioResultCard");
+  card.hidden = false;
+  card.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  const banner = document.getElementById("prioBanner");
+  const note = document.getElementById("prioDownloadNote");
+  const dlBtn = document.getElementById("prioDownloadBtn");
+  dlBtn.hidden = true;
+
+  if (r.downloadable) {
+    banner.className = "banner ok";
+    banner.textContent =
+      `✓ ${expected} 字节全部有唯一裁决（无缺口、无未决冲突），可以下载裁决后的二进制。`;
+  } else {
+    const problems = [];
+    if (!r.complete) problems.push(`存在 ${r.gaps.length} 段缺口（共 ${r.stats.gap_length} 字节）`);
+    if (r.has_conflict) problems.push(`存在 ${r.conflicts.length} 段未决冲突（共 ${r.stats.conflict_length} 字节）`);
+    banner.className = "banner bad";
+    banner.textContent = "✗ 无法形成唯一裁决：" + problems.join("；") + "。";
+  }
+
+  const stats = document.getElementById("prioStats");
+  stats.innerHTML = "";
+  const s = r.stats;
+  [
+    ["分片数", s.fragment_count],
+    ["输入字节总量", s.total_input_bytes],
+    ["已覆盖字节", `${s.covered_length} / ${expected}`, r.complete ? "ok" : "warn"],
+    ["已裁决字节（唯一取值）", s.decided_length, s.decided_length === expected ? "ok" : "warn"],
+    ["缺口字节", s.gap_length, s.gap_length ? "bad" : "ok"],
+    ["未决冲突字节", s.conflict_length, s.conflict_length ? "bad" : "ok"],
+    ["被高级片恢复的冲突字节", s.recovered_conflict_bytes, s.recovered_conflict_bytes ? "ok" : ""],
+    ["低级片被抑制写入次数", s.suppressed_write_count, s.suppressed_write_count ? "warn" : "ok"],
+    ["同级同值去重字节", s.duplicate_bytes],
+  ].forEach(([k, v, cls]) => stats.appendChild(addStat(k, v, cls)));
+
+  renderBar(expected, r.coverage, r.conflicts, "prioBar", "prioBarHint");
+
+  // 获胜来源区间：展示裁决依据（来源片 # + 优先级）
+  document.getElementById("prioSourceCount").textContent = `（${r.source_runs.length} 段）`;
+  const sourceUl = document.getElementById("prioSourceList");
+  sourceUl.innerHTML = "";
+  if (r.source_runs.length === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "无已裁决字节";
+    sourceUl.appendChild(li);
+  }
+  r.source_runs.slice(0, LIST_LIMIT).forEach((run) => {
+    const li = document.createElement("li");
+    li.textContent =
+      `${fmtRange([run.start, run.end])} ｜ 来源片 #${run.fragment}（优先级 ${run.priority}）`;
+    li.title = `十进制 [${run.start}, ${run.end})，由第 ${run.fragment} 个分片（优先级 ${run.priority}）裁决`;
+    sourceUl.appendChild(li);
+  });
+  if (r.source_runs.length > LIST_LIMIT) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = `… 其余 ${r.source_runs.length - LIST_LIMIT} 个区间已省略`;
+    sourceUl.appendChild(li);
+  }
+
+  document.getElementById("prioConflictCount").textContent = `（${r.conflicts.length} 段）`;
+  document.getElementById("prioGapCount").textContent = `（${r.gaps.length} 段）`;
+  fillRangeList(document.getElementById("prioConflictList"), r.conflicts, "无未决冲突", LIST_LIMIT);
+  fillRangeList(document.getElementById("prioGapList"), r.gaps, "无缺口，[0, 预期长度) 全覆盖", LIST_LIMIT);
+
+  // 未决冲突样本：列出最高优先级层的候选值与各自最早来源片，作为裁决依据
+  const samplesBox = document.getElementById("prioConflictSamples");
+  samplesBox.innerHTML = "";
+  r.conflict_samples.forEach((sm) => {
+    const cands = sm.candidates
+      .map((c) => `#${c.fragment} 给出 ${hexByte(c.value)}`)
+      .join(" ≠ ");
+    const line = document.createElement("div");
+    line.className = "sample-line";
+    line.textContent =
+      `偏移 ${sm.offset} (${hexOff(sm.offset)})：优先级 ${sm.priority} 层 ${cands}` +
+      (sm.candidates_truncated ? "（候选值过多，仅列前若干个）" : "");
+    samplesBox.appendChild(line);
+  });
+  if (r.conflict_samples_truncated) {
+    const more = document.createElement("div");
+    more.className = "hint";
+    more.textContent = "冲突位置过多，仅展示前若干个位置的候选值。";
+    samplesBox.appendChild(more);
+  }
+
+  // 分片表（含优先级）
+  const tbody = document.querySelector("#prioFragTable tbody");
+  tbody.innerHTML = "";
+  r.fragments.forEach((f) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${f.index}</td>` +
+      `<td class="prio-cell">${f.priority}</td>` +
+      `<td><code>${f.offset} (${hexOff(f.offset)})</code></td>` +
+      `<td>${f.length}</td>` +
+      `<td><code>[${f.offset}, ${f.end})</code></td>`;
+    tbody.appendChild(tr);
+  });
+
+  renderPreview(expected, r.preview_hex || "", r.preview_truncated, r.conflicts, "prioPreview");
+
+  if (r.downloadable) {
+    dlBtn.hidden = false;
+    note.textContent = `下载内容为优先级裁决后的 ${expected} 字节原始二进制。`;
+    dlBtn.onclick = () => {
+      window.location.href = r.download_url;
+    };
+  } else {
+    note.textContent = "仅当全部字节都有唯一裁决（无缺口、无未决冲突）时才提供下载。";
+  }
+}
+
 // 初始放一个空分片，方便直接输入
 addFragment();
 
 // 输入发生变化后，旧的重组结果不再可信，隐藏结果区
 function invalidateResult() {
   els.resultCard.hidden = true;
+  document.getElementById("prioResultCard").hidden = true;
   els.error.hidden = true;
 }
 els.expectedLength.addEventListener("input", invalidateResult);
